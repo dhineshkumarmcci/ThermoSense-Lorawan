@@ -17,7 +17,7 @@ Author:
 #include <Catena.h>
 #include <Catena_Led.h>
 #include <CatenaStm32L0Rtc.h>
-
+#include <Adafruit_BME280.h>
 #include <Arduino_LoRaWAN.h>
 #include <lmic.h>
 #include <hal/hal.h>
@@ -25,6 +25,7 @@ Author:
 
 #include <OneWire.h>
 #include <DallasTemperature.h>
+
 
 /****************************************************************************\
 |
@@ -67,6 +68,8 @@ enum    {
         PIN_ONE_WIRE =  A2,        // XSDA1 == A2
         };
 
+    
+
 /****************************************************************************\
 |
 |       Read-only data.
@@ -101,6 +104,8 @@ const int gkTcxoVdd = D33;
 
 const char sVersion[] = "V1.0.0";
 
+static bool checkCompostSensorPresent(void);
+
 /****************************************************************************\
 |
 |       Variables.
@@ -126,10 +131,11 @@ Catena::LoRaWAN gLoRaWAN;
 
 //   The submersible temperature sensor
 OneWire oneWire(PIN_ONE_WIRE);
-DallasTemperature sensor_WaterTemp(&oneWire);
-bool fHasWaterTemp;
-bool fFoundWaterTemp;
+DallasTemperature sensor_CompostTemp(&oneWire);
+bool fHasCompostTemp;
 
+Adafruit_BME280 gBme; // The default initalizer creates an I2C connection
+bool fBme;
 
 /*
 
@@ -161,8 +167,9 @@ void setup(void)
         gCatena.begin();
 
         setup_platform();
-        setup_sensors();
-
+        setup_built_in_sensors();
+        setup_external_temp_sensor();
+        
         gCatena.SafePrintf("End of setup\n");
         }
 
@@ -292,8 +299,7 @@ void setup_platform(void)
                 gCatena.SafePrintf("Catena 4612-M%u\n", modnumber);
                 if (modnumber == 102 || modnumber == 103 || modnumber == 104)
                         {
-                        fHasWaterTemp = flags & CatenaBase::fHasWaterOneWire;
-                        // fSoilSensor = flags & CatenaBase::fHasSoilProbe;
+                        fHasCompostTemp = flags & CatenaBase::fHasWaterOneWire;
                         }
                 else
                         {
@@ -303,8 +309,7 @@ void setup_platform(void)
         else
                 {
                 gCatena.SafePrintf("No mods detected\n");
-                fHasWaterTemp = flags & CatenaBase::fHasWaterOneWire;
-                // fSoilSensor = flags & CatenaBase::fHasSoilProbe;
+                fHasCompostTemp = flags & CatenaBase::fHasWaterOneWire;
                 }
         }
 
@@ -330,9 +335,43 @@ Returns:
 
 */
 
-void setup_sensors(void)
-        {
+void setup_external_temp_sensor(void) {
+    bool fCompostTemp = checkCompostSensorPresent();
+        if(!fCompostTemp) {
+            gCatena.SafePrintf("No one-wire temperature sensor detected\n");
+         } else {
+          gCatena.SafePrintf("One-wire temperature sensor detected\n");
+         }
+  }
 
+ static bool checkCompostSensorPresent(void)
+ {
+  
+   sensor_CompostTemp.begin();
+   return sensor_CompostTemp.getDeviceCount() != 0;
+  }
+
+void setup_built_in_sensors(void)
+        {
+          uint32_t flags;
+if (flags & CatenaStm32::fHasBme280)
+    {
+    if (gBme.begin(BME280_ADDRESS, Adafruit_BME280::OPERATING_MODE::Sleep))
+      {
+      fBme = true;
+        gCatena.SafePrintf("BME280 found\n");
+      }
+    else
+      {
+      fBme = false;
+      gCatena.SafePrintf("No BME280 found: check wiring\n");
+      }
+    }
+  else
+    {
+    fBme = false;
+    gCatena.SafePrintf("No BME280 found: check wiring. Just nothing. \n");
+    }
         }
 
 /*
@@ -361,10 +400,11 @@ Returns:
 */
 
 
+
 void loop(void)
         {
         // put your main code here, to run repeatedly:
         gCatena.poll();
         Serial.println("hello world");
-        delay(2000);
+        delay(60000);
         }
