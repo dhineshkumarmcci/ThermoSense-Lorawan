@@ -196,6 +196,9 @@ void setup(void)
         setup_external_temp_sensor();
         
         gCatena.SafePrintf("End of setup\n");
+
+        /* for stm32 core, we need wider tolerances, it seems */
+        LMIC_setClockError(10 * 65536 / 100);
         
         /* trigger a join by sending the first packet */
         startSendingUplink();
@@ -368,6 +371,10 @@ Returns:
 
 void setup_external_temp_sensor(void)
         {
+        /* set D11 high so V_OUT2 is going to be high for onewire sensor */        
+        pinMode(11, OUTPUT);
+        digitalWrite(11, HIGH);
+        
         bool fCompostTemp = checkCompostSensorPresent();
         
         if(!fCompostTemp)
