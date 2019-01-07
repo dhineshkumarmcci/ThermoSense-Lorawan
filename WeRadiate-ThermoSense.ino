@@ -16,9 +16,11 @@ Author:
 
 #include <Catena.h>
 #include <Catena_Led.h>
+#include <Catena_TxBuffer.h>
 #include <CatenaStm32L0Rtc.h>
 #include <Adafruit_BME280.h>
 #include <Arduino_LoRaWAN.h>
+#include <Catena_Si1133.h>
 #include <lmic.h>
 #include <hal/hal.h>
 #include <mcciadk_baselib.h>
@@ -41,7 +43,8 @@ enum    {
         // Actual time will be a little longer because have to
         // add measurement and broadcast time, but we attempt
         // to compensate for the gross effects below.
-        CATCFG_T_CYCLE = 6 * 60,        // every 6 minutes
+        //CATCFG_T_CYCLE = 6 * 60,        // every 6 minutes
+        CATCFG_T_CYCLE = 480 * 60,        // 3 times a day(every 480 minutes)
         CATCFG_T_CYCLE_TEST = 30,       // every 10 seconds
         };
 
@@ -68,6 +71,13 @@ enum    {
         PIN_ONE_WIRE =  A2,        // XSDA1 == A2
         };
 
+// forwards
+static bool checkCompostSensorPresent(void);
+static void settleDoneCb(osjob_t *pSendJob);
+static void warmupDoneCb(osjob_t *pSendJob);
+static void txFailedDoneCb(osjob_t *pSendJob);
+static void sleepDoneCb(osjob_t *pSendJob);
+static Arduino_LoRaWAN::SendBufferCbFn sendBufferDoneCb;
     
 
 /****************************************************************************\
@@ -129,13 +139,28 @@ CatenaStm32L0Rtc gRtc;
 //
 Catena::LoRaWAN gLoRaWAN;
 
-//   The submersible temperature sensor
+// The submersible temperature sensor
 OneWire oneWire(PIN_ONE_WIRE);
 DallasTemperature sensor_CompostTemp(&oneWire);
 bool fHasCompostTemp;
 
+// The temperature/humidity sensor
 Adafruit_BME280 gBme; // The default initalizer creates an I2C connection
 bool fBme;
+
+// The LUX sensor
+Catena_Si1133 gSi1133;
+bool fLux;
+
+// USB power
+bool fUsbPower;
+
+// the job that's used to synchronize us with the LMIC code
+static osjob_t sensorJob;
+void sensorJob_cb(osjob_t *pJob);
+
+// The contact sensors
+bool fHasPower1;
 
 /*
 
@@ -171,6 +196,9 @@ void setup(void)
         setup_external_temp_sensor();
         
         gCatena.SafePrintf("End of setup\n");
+        
+        /* trigger a join by sending the first packet */
+        startSendingUplink();
         }
 
 /*
@@ -300,6 +328,9 @@ void setup_platform(void)
                 if (modnumber == 102 || modnumber == 103 || modnumber == 104)
                         {
                         fHasCompostTemp = flags & CatenaBase::fHasWaterOneWire;
+                        /* set D11 high so V_OUT2 is going to be high for onewire sensor */        
+                        pinMode(11, OUTPUT);
+                        digitalWrite(11, HIGH);
                         }
                 else
                         {
@@ -335,43 +366,78 @@ Returns:
 
 */
 
-void setup_external_temp_sensor(void) {
-    bool fCompostTemp = checkCompostSensorPresent();
-        if(!fCompostTemp) {
-            gCatena.SafePrintf("No one-wire temperature sensor detected\n");
-         } else {
-          gCatena.SafePrintf("One-wire temperature sensor detected\n");
-         }
-  }
+void setup_external_temp_sensor(void)
+        {
+        bool fCompostTemp = checkCompostSensorPresent();
+        
+        if(!fCompostTemp)
+                {
+                gCatena.SafePrintf("No one-wire temperature sensor detected\n");
+                }
+        else
+                {
+                gCatena.SafePrintf("One-wire temperature sensor detected\n");
+                }
+        }
 
  static bool checkCompostSensorPresent(void)
- {
-  
-   sensor_CompostTemp.begin();
-   return sensor_CompostTemp.getDeviceCount() != 0;
-  }
+        {
+        sensor_CompostTemp.begin();
+        return sensor_CompostTemp.getDeviceCount() != 0;
+        }
 
 void setup_built_in_sensors(void)
         {
-          uint32_t flags;
-if (flags & CatenaStm32::fHasBme280)
-    {
-    if (gBme.begin(BME280_ADDRESS, Adafruit_BME280::OPERATING_MODE::Sleep))
-      {
-      fBme = true;
-        gCatena.SafePrintf("BME280 found\n");
-      }
-    else
-      {
-      fBme = false;
-      gCatena.SafePrintf("No BME280 found: check wiring\n");
-      }
-    }
-  else
-    {
-    fBme = false;
-    gCatena.SafePrintf("No BME280 found: check wiring. Just nothing. \n");
-    }
+        uint32_t flags;
+        flags = gCatena.GetPlatformFlags();
+  
+        /* initialize the lux sensor */
+        if (flags & CatenaStm32::fHasLuxSi1113)
+                {
+                if (gSi1133.begin())
+                        {
+                        fLux = true;
+                        gSi1133.configure(0, CATENA_SI1133_MODE_SmallIR);
+                        gSi1133.configure(1, CATENA_SI1133_MODE_White);
+                        gSi1133.configure(2, CATENA_SI1133_MODE_UV);
+                        gSi1133.start();
+                        }
+                else
+                        {
+                        fLux = false;
+                        gCatena.SafePrintf("No Si1133 found: check wiring\n");
+                        }
+                }
+        else
+                {
+                gCatena.SafePrintf("No Si1133 wiring\n");
+                fLux = false;
+                }
+    
+        /* initialize the BME280 */
+        if (flags & CatenaStm32::fHasBme280)
+                {
+                if (gBme.begin(BME280_ADDRESS, Adafruit_BME280::OPERATING_MODE::Sleep))
+                        {
+                        fBme = true;
+                        gCatena.SafePrintf("BME280 found\n");
+                        }
+                else
+                        {
+                        fBme = false;
+                        gCatena.SafePrintf("No BME280 found: check wiring\n");
+                        }
+                }
+        else
+                {
+                fBme = false;
+                gCatena.SafePrintf("No BME280 found: check wiring. Just nothing. \n");
+                }
+
+        if (fLux)
+                {
+                delay(510); /* default measure interval is 500ms */
+                }
         }
 
 /*
@@ -405,6 +471,216 @@ void loop(void)
         {
         // put your main code here, to run repeatedly:
         gCatena.poll();
-        Serial.println("hello world");
-        delay(60000);
+        //Serial.println("hello world");
+        //delay(60000);
+        }
+
+void startSendingUplink(void)
+        {
+        TxBuffer_t b;
+        LedPattern savedLed = gLed.Set(LedPattern::Measuring);
+
+        b.begin();
+        FlagsSensor2 flag;
+
+        flag = FlagsSensor2(0);
+
+        b.put(FormatSensor2); /* the flag for this record format */
+        uint8_t * const pFlag = b.getp();
+        b.put(0x00); /* will be set to the flags */
+
+        // vBat is sent as 5000 * v
+        float vBat = gCatena.ReadVbat();
+        gCatena.SafePrintf("vBat:    %d mV\n", (int) (vBat * 1000.0f));
+        b.putV(vBat);
+        flag |= FlagsSensor2::FlagVbat;
+      
+        // vBus is sent as 5000 * v
+        float vBus = gCatena.ReadVbus();
+        gCatena.SafePrintf("vBus:    %d mV\n", (int) (vBus * 1000.0f));
+        fUsbPower = (vBus > 3.0) ? true : false;
+
+        uint32_t bootCount;
+        if (gCatena.getBootCount(bootCount))
+                {
+                b.putBootCountLsb(bootCount);
+                flag |= FlagsSensor2::FlagBoot;
+                }
+
+        if (fBme)
+                {
+                Adafruit_BME280::Measurements m = gBme.readTemperaturePressureHumidity();
+                // temperature is 2 bytes from -0x80.00 to +0x7F.FF degrees C
+                // pressure is 2 bytes, hPa * 10.
+                // humidity is one byte, where 0 == 0/256 and 0xFF == 255/256.
+                gCatena.SafePrintf(
+                        "BME280:  T: %d P: %d RH: %d\n",
+                        (int) m.Temperature,
+                        (int) m.Pressure,
+                        (int) m.Humidity
+                        );
+                b.putT(m.Temperature);
+                b.putP(m.Pressure);
+                b.putRH(m.Humidity);
+    
+                flag |= FlagsSensor2::FlagTPH;
+                }
+
+        if (fLux)
+                {
+                /* Get a new sensor event */
+                uint16_t data[3];
+    
+                gSi1133.readMultiChannelData(data, 3);
+                gSi1133.stop();
+                gCatena.SafePrintf(
+                        "Si1133:  %u IR, %u White, %u UV\n",
+                        data[0],
+                        data[1],
+                        data[2]
+                        );
+                b.putLux(data[1]);
+                flag |= FlagsSensor2::FlagLux;
+                }
+    
+        /*
+        || Measure and transmit the "water temperature" (OneWire)
+        || tranducer value. This is complicated because we want
+        || to support plug/unplug and the sw interface is not
+        || really hot-pluggable.
+        */
+        
+        /* set D11 high so V_OUT2 is going to be high for onewire sensor */        
+        pinMode(11, OUTPUT);
+        digitalWrite(11, HIGH);
+        
+        bool fCompostTemp = checkCompostSensorPresent();
+      
+        if (fCompostTemp)
+                {
+                sensor_CompostTemp.requestTemperatures();
+                float compostTempC = sensor_CompostTemp.getTempCByIndex(0);
+                Serial.print("Compost temperature: "); Serial.print(compostTempC); Serial.println(" C");
+                }
+        else if (fHasCompostTemp)
+                {
+                gCatena.SafePrintf("No compost temperature\n");
+                }
+             
+        /* set D11 low to turn off after measuring */        
+        digitalWrite(11, LOW);
+      
+        *pFlag = uint8_t(flag);
+        if (savedLed != LedPattern::Joining)
+                {
+                gLed.Set(LedPattern::Sending);
+                }
+        else
+                {
+                gLed.Set(LedPattern::Joining);
+                }
+        
+        gLoRaWAN.SendBuffer(b.getbase(), b.getn(), sendBufferDoneCb, NULL);
+}
+
+static void
+sendBufferDoneCb(
+        void *pContext,
+        bool fStatus
+        )
+        {
+        osjobcb_t pFn;
+
+        gLed.Set(LedPattern::Settling);
+        if (! fStatus)
+                {
+                gCatena.SafePrintf("send buffer failed\n");
+                pFn = txFailedDoneCb;
+                }
+        else
+                {
+                pFn = settleDoneCb;
+                }
+        os_setTimedCallback(
+                &sensorJob,
+                os_getTime()+sec2osticks(CATCFG_T_SETTLE),
+                pFn
+                );
+        }
+
+static void
+txFailedDoneCb(
+        osjob_t *pSendJob
+        )
+        {
+        gCatena.SafePrintf("not provisioned, idling\n");
+        gLoRaWAN.Shutdown();
+        gLed.Set(LedPattern::NotProvisioned);
+        }
+
+static void settleDoneCb(
+        osjob_t *pSendJob
+        )
+        {
+        // if connected to USB, don't sleep
+        // ditto if we're monitoring pulses.
+  
+#ifdef USBCON
+        if (fUsbPower || fHasPower1)
+#else
+        if (fHasPower1)
+#endif
+        {
+        gLed.Set(LedPattern::Sleeping);
+        os_setTimedCallback(
+                &sensorJob,
+                os_getTime() + sec2osticks(CATCFG_T_INTERVAL),
+                sleepDoneCb
+                );
+        return;
+        }
+
+        /* ok... now it's time for a deep sleep */
+        gLed.Set(LedPattern::Off);
+        Serial.end();
+        Wire.end();
+        /*
+        SPI.end();
+        if (fFlash)
+        gSPI2.end();
+        */
+
+        gCatena.Sleep(CATCFG_T_INTERVAL);
+
+        /* and now... we're awake again. trigger another measurement */
+        Serial.begin();
+        Wire.begin();
+        /*
+        SPI.begin();
+        if (fFlash)
+        gSPI2.begin();
+        */
+        
+        sleepDoneCb(pSendJob);
+        }
+
+static void sleepDoneCb(
+        osjob_t *pJob
+        )
+        {
+        gLed.Set(LedPattern::WarmingUp);
+        gSi1133.start();
+
+        os_setTimedCallback(
+                &sensorJob,
+                os_getTime() + sec2osticks(CATCFG_T_WARMUP),
+                warmupDoneCb
+                );
+        }
+
+static void warmupDoneCb(
+        osjob_t *pJob
+        )
+        {
+        startSendingUplink();
         }
