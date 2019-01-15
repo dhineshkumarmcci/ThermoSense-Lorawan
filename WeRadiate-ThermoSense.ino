@@ -17,13 +17,13 @@ Author:
 #include <Catena.h>
 #include <Catena_Led.h>
 #include <Catena_TxBuffer.h>
-#include <CatenaStm32L0Rtc.h>
 #include <Adafruit_BME280.h>
 #include <Arduino_LoRaWAN.h>
 #include <Catena_Si1133.h>
 #include <lmic.h>
 #include <hal/hal.h>
 #include <mcciadk_baselib.h>
+#include <SPI.h>
 
 #include <OneWire.h>
 #include <DallasTemperature.h>
@@ -73,11 +73,11 @@ enum    {
 
 // forwards
 static bool checkCompostSensorPresent(void);
-static void settleDoneCb(osjob_t *pSendJob);
-static void warmupDoneCb(osjob_t *pSendJob);
-static void txFailedDoneCb(osjob_t *pSendJob);
-static void sleepDoneCb(osjob_t *pSendJob);
-static Arduino_LoRaWAN::SendBufferCbFn sendBufferDoneCb;
+void settleDoneCb(osjob_t *pSendJob);
+void warmupDoneCb(osjob_t *pSendJob);
+void txFailedDoneCb(osjob_t *pSendJob);
+void sleepDoneCb(osjob_t *pSendJob);
+Arduino_LoRaWAN::SendBufferCbFn sendBufferDoneCb;
     
 
 /****************************************************************************\
@@ -86,35 +86,8 @@ static Arduino_LoRaWAN::SendBufferCbFn sendBufferDoneCb;
 |
 \****************************************************************************/
 
-//
-// if this pin is written high, it enables the boost regulator. If running off batteries, this
-// means that Vdd will be 3.3V (rather than Vbat).
-// If running off USB power, this has no effect.
-//
-// Enabling the boost regulator is a good idea in the following situations:
-// 
-//  1) if you are enabling external Vdd to extenral sensors.
-//  2) if you are trying for maximum transmit power from the SX1276.
-//
-// However, it's good only to do this when you need to. The 4612 doesn't need 3.3V
-// when sleeping, and the boost regulator takes non-negligible power.
-//
-const int gkVddBoostEnable = A0;
+const char sVersion[] = "1.0.0";
 
-//
-// if this pin is written high, it enables the TCXO (temperature-compensated crystal
-// oscillator). The TCXO must be powered up before trying to do anything serious 
-// with the radio. The normal delay after turning on the TCXO is 1ms to 3ms. MCCI is
-// changing the LMIC code to handle it, but on 2018-09-14 it still wasn't ready,
-// so we do it manually. Once the LMIC is ready, it will manage this pin dynamically
-// so if we forget, nothing bad will happen, as long as we just set it up at the
-// beginning of time.
-//
-const int gkTcxoVdd = D33;
-
-const char sVersion[] = "V1.0.0";
-
-static bool checkCompostSensorPresent(void);
 
 /****************************************************************************\
 |
@@ -128,9 +101,6 @@ Catena gCatena;
 // the LED
 //
 StatusLed gLed (Catena::PIN_STATUS_LED);
-
-// the RTC instance, used for sleeping
-CatenaStm32L0Rtc gRtc;
 
 //
 // the LoRaWAN backhaul.  Note that we use the
@@ -228,12 +198,6 @@ Returns:
 
 void setup_platform(void)
         {
-        // set up power supplies and TCXO
-        pinMode(gkVddBoostEnable, OUTPUT);
-        digitalWrite(gkVddBoostEnable, 1);
-        pinMode(gkTcxoVdd, OUTPUT);
-        digitalWrite(gkTcxoVdd, 1);
-
 #ifdef USBCON
         // if running unattended, don't wait for USB connect.
         if (!(gCatena.GetOperatingFlags() &
@@ -267,9 +231,6 @@ void setup_platform(void)
         gLed.begin();
         gCatena.registerObject(&gLed);
         gLed.Set(LedPattern::FastFlash);
-
-        // set up the RTC object
-        gRtc.begin();
 
         gCatena.SafePrintf("LoRaWAN init: ");
         if (!gLoRaWAN.begin(&gCatena))
@@ -323,7 +284,7 @@ void setup_platform(void)
         /* is it modded? */
         uint32_t modnumber = gCatena.PlatformFlags_GetModNumber(flags);
 
-        //fHasPower1 = false;
+        fHasPower1 = false;
 
         if (modnumber != 0)
                 {
@@ -332,8 +293,8 @@ void setup_platform(void)
                         {
                         fHasCompostTemp = flags & CatenaBase::fHasWaterOneWire;
                         /* set D11 high so V_OUT2 is going to be high for onewire sensor */        
-                        pinMode(11, OUTPUT);
-                        digitalWrite(11, HIGH);
+                        pinMode(D11, OUTPUT);
+                        digitalWrite(D11, HIGH);
                         }
                 else
                         {
@@ -372,8 +333,8 @@ Returns:
 void setup_external_temp_sensor(void)
         {
         /* set D11 high so V_OUT2 is going to be high for onewire sensor */        
-        pinMode(11, OUTPUT);
-        digitalWrite(11, HIGH);
+        pinMode(D11, OUTPUT);
+        digitalWrite(D11, HIGH);
         
         bool fCompostTemp = checkCompostSensorPresent();
         
@@ -478,8 +439,6 @@ void loop(void)
         {
         // put your main code here, to run repeatedly:
         gCatena.poll();
-        //Serial.println("hello world");
-        //delay(60000);
         }
 
 void startSendingUplink(void)
@@ -558,8 +517,8 @@ void startSendingUplink(void)
         */
         
         /* set D11 high so V_OUT2 is going to be high for onewire sensor */        
-        pinMode(11, OUTPUT);
-        digitalWrite(11, HIGH);
+        pinMode(D11, OUTPUT);
+        digitalWrite(D11, HIGH);
         
         bool fCompostTemp = checkCompostSensorPresent();
       
@@ -575,7 +534,8 @@ void startSendingUplink(void)
                 }
              
         /* set D11 low to turn off after measuring */        
-        digitalWrite(11, LOW);
+//        digitalWrite(D11, LOW);
+        pinMode(D11, INPUT);
       
         *pFlag = uint8_t(flag);
         if (savedLed != LedPattern::Joining)
@@ -590,7 +550,7 @@ void startSendingUplink(void)
         gLoRaWAN.SendBuffer(b.getbase(), b.getn(), sendBufferDoneCb, NULL);
 }
 
-static void
+void
 sendBufferDoneCb(
         void *pContext,
         bool fStatus
@@ -615,7 +575,7 @@ sendBufferDoneCb(
                 );
         }
 
-static void
+void
 txFailedDoneCb(
         osjob_t *pSendJob
         )
@@ -625,13 +585,13 @@ txFailedDoneCb(
         gLed.Set(LedPattern::NotProvisioned);
         }
 
-static void settleDoneCb(
+void settleDoneCb(
         osjob_t *pSendJob
         )
         {
         // if connected to USB, don't sleep
         // ditto if we're monitoring pulses.
-  
+	// XXX: do we need this?
 #ifdef USBCON
         if (fUsbPower || fHasPower1)
 #else
@@ -651,27 +611,19 @@ static void settleDoneCb(
         gLed.Set(LedPattern::Off);
         Serial.end();
         Wire.end();
-        /*
         SPI.end();
-        if (fFlash)
-        gSPI2.end();
-        */
 
         gCatena.Sleep(CATCFG_T_INTERVAL);
 
         /* and now... we're awake again. trigger another measurement */
         Serial.begin();
         Wire.begin();
-        /*
         SPI.begin();
-        if (fFlash)
-        gSPI2.begin();
-        */
         
         sleepDoneCb(pSendJob);
         }
 
-static void sleepDoneCb(
+void sleepDoneCb(
         osjob_t *pJob
         )
         {
@@ -685,7 +637,7 @@ static void sleepDoneCb(
                 );
         }
 
-static void warmupDoneCb(
+void warmupDoneCb(
         osjob_t *pJob
         )
         {
