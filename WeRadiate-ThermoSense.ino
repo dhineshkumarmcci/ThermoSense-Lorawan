@@ -17,13 +17,13 @@ Author:
 #include <Catena.h>
 #include <Catena_Led.h>
 #include <Catena_TxBuffer.h>
+#include <Catena_Mx25v8035f.h>
 #include <Adafruit_BME280.h>
 #include <Arduino_LoRaWAN.h>
 #include <Catena_Si1133.h>
 #include <lmic.h>
 #include <hal/hal.h>
 #include <mcciadk_baselib.h>
-#include <SPI.h>
 
 #include <OneWire.h>
 #include <DallasTemperature.h>
@@ -121,6 +121,16 @@ bool fBme;
 // The LUX sensor
 Catena_Si1133 gSi1133;
 bool fLux;
+
+SPIClass gSPI2(
+		Catena::PIN_SPI2_MOSI,
+		Catena::PIN_SPI2_MISO,
+		Catena::PIN_SPI2_SCK
+		);
+
+//   The flash
+Catena_Mx25v8035f gFlash;
+bool fFlash;
 
 // USB power
 bool fUsbPower;
@@ -280,6 +290,21 @@ void setup_platform(void)
                 gCatena.SafePrintf("**** no platform, check provisioning ****\n");
                 flags = 0;
                 }
+
+	/* initialize the FLASH */
+	if (gFlash.begin(&gSPI2, Catena::PIN_SPI2_FLASH_SS))
+		{
+		fFlash = true;
+		gFlash.powerDown();
+		gCatena.SafePrintf("FLASH found, put power down\n");
+		}
+	else
+		{
+		fFlash = false;
+		gFlash.end();
+		gSPI2.end();
+		gCatena.SafePrintf("No FLASH found: check wiring\n");
+		}
 
         /* is it modded? */
         uint32_t modnumber = gCatena.PlatformFlags_GetModNumber(flags);
@@ -612,6 +637,8 @@ void settleDoneCb(
         Serial.end();
         Wire.end();
         SPI.end();
+	if (fFlash)
+		gSPI2.end();
 
         gCatena.Sleep(CATCFG_T_INTERVAL);
 
@@ -619,7 +646,9 @@ void settleDoneCb(
         Serial.begin();
         Wire.begin();
         SPI.begin();
-        
+	if (fFlash)
+		gSPI2.begin();
+
         sleepDoneCb(pSendJob);
         }
 
