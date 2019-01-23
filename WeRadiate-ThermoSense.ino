@@ -1,4 +1,4 @@
-/*
+ /*
 
 Module:  WeRadiate-ThermoSense.ino
 
@@ -472,9 +472,9 @@ void startSendingUplink(void)
         LedPattern savedLed = gLed.Set(LedPattern::Measuring);
 
         b.begin();
-        FlagsSensor2 flag;
+        FlagsSensor3 flag;
 
-        flag = FlagsSensor2(0);
+        flag = FlagsSensor3(0);
 
         b.put(FormatSensor2); /* the flag for this record format */
         uint8_t * const pFlag = b.getp();
@@ -484,7 +484,7 @@ void startSendingUplink(void)
         float vBat = gCatena.ReadVbat();
         gCatena.SafePrintf("vBat:    %d mV\n", (int) (vBat * 1000.0f));
         b.putV(vBat);
-        flag |= FlagsSensor2::FlagVbat;
+        flag |= FlagsSensor3::FlagVbat;
       
         // vBus is sent as 5000 * v
         float vBus = gCatena.ReadVbus();
@@ -495,7 +495,7 @@ void startSendingUplink(void)
         if (gCatena.getBootCount(bootCount))
                 {
                 b.putBootCountLsb(bootCount);
-                flag |= FlagsSensor2::FlagBoot;
+                flag |= FlagsSensor3::FlagBoot;
                 }
 
         if (fBme)
@@ -514,7 +514,7 @@ void startSendingUplink(void)
                 b.putP(m.Pressure);
                 b.putRH(m.Humidity);
     
-                flag |= FlagsSensor2::FlagTPH;
+                flag |= FlagsSensor3::FlagTPH;
                 }
 
         if (fLux)
@@ -531,7 +531,7 @@ void startSendingUplink(void)
                         data[2]
                         );
                 b.putLux(data[1]);
-                flag |= FlagsSensor2::FlagLux;
+                flag |= FlagsSensor3::FlagLux;
                 }
     
         /*
@@ -552,6 +552,9 @@ void startSendingUplink(void)
                 sensor_CompostTemp.requestTemperatures();
                 float compostTempC = sensor_CompostTemp.getTempCByIndex(0);
                 Serial.print("Compost temperature: "); Serial.print(compostTempC); Serial.println(" C");
+                // transmit the measurement
+                b.putT(compostTempC);
+                flag |= FlagsSensor3::FlagWater;
                 }
         else if (fHasCompostTemp)
                 {
