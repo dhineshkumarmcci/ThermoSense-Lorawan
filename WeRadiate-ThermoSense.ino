@@ -43,7 +43,6 @@ enum    {
         // Actual time will be a little longer because have to
         // add measurement and broadcast time, but we attempt
         // to compensate for the gross effects below.
-        //CATCFG_T_CYCLE = 6 * 60,        // every 6 minutes
         CATCFG_T_CYCLE = 480 * 60,        // 3 times a day(every 480 minutes)
         CATCFG_T_CYCLE_TEST = 30,       // every 10 seconds
         };
@@ -77,6 +76,8 @@ void settleDoneCb(osjob_t *pSendJob);
 void warmupDoneCb(osjob_t *pSendJob);
 void txFailedDoneCb(osjob_t *pSendJob);
 void sleepDoneCb(osjob_t *pSendJob);
+void prepareToSleep(void);
+void recoverFromSleep(void);
 Arduino_LoRaWAN::SendBufferCbFn sendBufferDoneCb;
     
 
@@ -139,9 +140,6 @@ bool fUsbPower;
 static osjob_t sensorJob;
 void sensorJob_cb(osjob_t *pJob);
 
-// The contact sensors
-bool fHasPower1;
-
 /*
 
 Name:	setup()
@@ -177,7 +175,7 @@ void setup(void)
         
         gCatena.SafePrintf("End of setup\n");
 
-        /* for stm32 core, we need wider tolerances, it seems */
+        /* for stm32 core, we need wider tolerances, it seems. This sets the clock tolerence to +/- 10% */
         LMIC_setClockError(10 * 65536 / 100);
         
         /* trigger a join by sending the first packet */
@@ -291,35 +289,31 @@ void setup_platform(void)
                 flags = 0;
                 }
 
-	/* initialize the FLASH */
-	if (gFlash.begin(&gSPI2, Catena::PIN_SPI2_FLASH_SS))
-		{
-		fFlash = true;
-		gFlash.powerDown();
-		gCatena.SafePrintf("FLASH found, put power down\n");
-		}
-	else
-		{
-		fFlash = false;
-		gFlash.end();
-		gSPI2.end();
-		gCatena.SafePrintf("No FLASH found: check wiring\n");
-		}
+        /* initialize the FLASH */
+        if (gFlash.begin(&gSPI2, Catena::PIN_SPI2_FLASH_SS))
+                {
+                fFlash = true;
+                gFlash.powerDown();
+                gCatena.SafePrintf("FLASH found, put power down\n");
+                }
+        else
+                {
+                fFlash = false;
+                gFlash.end();
+                gSPI2.end();
+                gCatena.SafePrintf("No FLASH found: check board\n");
+                }
 
         /* is it modded? */
         uint32_t modnumber = gCatena.PlatformFlags_GetModNumber(flags);
 
-        fHasPower1 = false;
-
+        /* modnumber is 102 for WeRadiate app */
         if (modnumber != 0)
                 {
                 gCatena.SafePrintf("Catena 4612-M%u\n", modnumber);
-                if (modnumber == 102 || modnumber == 103 || modnumber == 104)
+                if (modnumber == 102)
                         {
                         fHasCompostTemp = flags & CatenaBase::fHasWaterOneWire;
-                        /* set D11 high so V_OUT2 is going to be high for onewire sensor */        
-                        pinMode(D11, OUTPUT);
-                        digitalWrite(D11, HIGH);
                         }
                 else
                         {
@@ -329,7 +323,6 @@ void setup_platform(void)
         else
                 {
                 gCatena.SafePrintf("No mods detected\n");
-                fHasCompostTemp = flags & CatenaBase::fHasWaterOneWire;
                 }
         }
 
@@ -357,10 +350,6 @@ Returns:
 
 void setup_external_temp_sensor(void)
         {
-        /* set D11 high so V_OUT2 is going to be high for onewire sensor */        
-        pinMode(D11, OUTPUT);
-        digitalWrite(D11, HIGH);
-        
         bool fCompostTemp = checkCompostSensorPresent();
         
         if(!fCompostTemp)
@@ -375,6 +364,10 @@ void setup_external_temp_sensor(void)
 
  static bool checkCompostSensorPresent(void)
         {
+        /* set D11 high so V_OUT2 is going to be high for onewire sensor */        
+        pinMode(D11, OUTPUT);
+        digitalWrite(D11, HIGH);
+        
         sensor_CompostTemp.begin();
         return sensor_CompostTemp.getDeviceCount() != 0;
         }
@@ -398,7 +391,7 @@ void setup_built_in_sensors(void)
                 else
                         {
                         fLux = false;
-                        gCatena.SafePrintf("No Si1133 found: check wiring\n");
+                        gCatena.SafePrintf("No Si1133 found: check platform selection\n");
                         }
                 }
         else
@@ -418,19 +411,14 @@ void setup_built_in_sensors(void)
                 else
                         {
                         fBme = false;
-                        gCatena.SafePrintf("No BME280 found: check wiring\n");
+                        gCatena.SafePrintf("No BME280 found: check platfom setting\n");
                         }
                 }
         else
                 {
                 fBme = false;
                 gCatena.SafePrintf("No BME280 found: check wiring. Just nothing. \n");
-                }
-
-        if (fLux)
-                {
-                delay(510); /* default measure interval is 500ms */
-                }
+                }                
         }
 
 /*
@@ -476,7 +464,7 @@ void startSendingUplink(void)
 
         flag = FlagsSensor3(0);
 
-        b.put(FormatSensor2); /* the flag for this record format */
+        b.put(FormatSensor3); /* the flag for this record format */
         uint8_t * const pFlag = b.getp();
         b.put(0x00); /* will be set to the flags */
 
@@ -515,23 +503,6 @@ void startSendingUplink(void)
                 b.putRH(m.Humidity);
     
                 flag |= FlagsSensor3::FlagTPH;
-                }
-
-        if (fLux)
-                {
-                /* Get a new sensor event */
-                uint16_t data[3];
-    
-                gSi1133.readMultiChannelData(data, 3);
-                gSi1133.stop();
-                gCatena.SafePrintf(
-                        "Si1133:  %u IR, %u White, %u UV\n",
-                        data[0],
-                        data[1],
-                        data[2]
-                        );
-                b.putLux(data[1]);
-                flag |= FlagsSensor3::FlagLux;
                 }
     
         /*
@@ -576,7 +547,7 @@ void startSendingUplink(void)
                 }
         
         gLoRaWAN.SendBuffer(b.getbase(), b.getn(), sendBufferDoneCb, NULL);
-}
+        }
 
 void
 sendBufferDoneCb(
@@ -618,39 +589,30 @@ void settleDoneCb(
         )
         {
         // if connected to USB, don't sleep
-        // ditto if we're monitoring pulses.
-	// XXX: do we need this?
+        // XXX: do we need this?
 #ifdef USBCON
-        if (fUsbPower || fHasPower1)
+        const bool fCanSleep =! fUsbPower;
 #else
-        if (fHasPower1)
+        const bool fCanSleep = true;
 #endif
-        {
-        gLed.Set(LedPattern::Sleeping);
-        os_setTimedCallback(
-                &sensorJob,
-                os_getTime() + sec2osticks(CATCFG_T_INTERVAL),
-                sleepDoneCb
-                );
-        return;
-        }
+        if (! fCanSleep)
+                {
+                gLed.Set(LedPattern::Sleeping);
+                os_setTimedCallback(
+                        &sensorJob,
+                        os_getTime() + sec2osticks(CATCFG_T_INTERVAL),
+                        sleepDoneCb
+                        );
+                return;
+                }
 
-        /* ok... now it's time for a deep sleep */
-        gLed.Set(LedPattern::Off);
-        Serial.end();
-        Wire.end();
-        SPI.end();
-	if (fFlash)
-		gSPI2.end();
+        /* we are allowed to do a deep sleep */
+        prepareToSleep();
 
         gCatena.Sleep(CATCFG_T_INTERVAL);
 
         /* and now... we're awake again. trigger another measurement */
-        Serial.begin();
-        Wire.begin();
-        SPI.begin();
-	if (fFlash)
-		gSPI2.begin();
+        recoverFromSleep();
 
         sleepDoneCb(pSendJob);
         }
@@ -659,9 +621,6 @@ void sleepDoneCb(
         osjob_t *pJob
         )
         {
-        gLed.Set(LedPattern::WarmingUp);
-        gSi1133.start();
-
         os_setTimedCallback(
                 &sensorJob,
                 os_getTime() + sec2osticks(CATCFG_T_WARMUP),
@@ -674,4 +633,25 @@ void warmupDoneCb(
         )
         {
         startSendingUplink();
+        }
+
+void prepareToSleep(void)
+        {
+        gLed.Set(LedPattern::Off);         
+        Serial.end();
+        Wire.end();
+        SPI.end();
+        if (fFlash)
+                gSPI2.end();
+        }
+
+void recoverFromSleep(void)
+        {
+        Serial.begin();
+        Wire.begin();
+        SPI.begin();
+        if (fFlash)
+                gSPI2.begin();
+        gLed.Set(LedPattern::WarmingUp);
+        gSi1133.start();
         }
