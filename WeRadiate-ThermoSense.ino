@@ -57,7 +57,7 @@ enum    {
         // the settling time uplink, in seconds
         CATCFG_T_SETTLE = 5,
         // the amount of overhead, total, in seconds.
-        CATCFG_T_OVERHEAD = (CATCFG_T_WARMUP + CATCFG_T_SETTLE + 4),
+        CATCFG_T_OVERHEAD = (CATCFG_T_WARMUP + CATCFG_T_SETTLE + 2),
         // the minimum cycle time
         CATCFG_T_MIN = CATCFG_T_OVERHEAD,
         // length of day in seconds
