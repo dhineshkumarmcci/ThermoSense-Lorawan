@@ -43,7 +43,7 @@ enum    {
         // Actual time will be a little longer because have to
         // add measurement and broadcast time, but we attempt
         // to compensate for the gross effects below.
-        CATCFG_T_CYCLE = 8 * 60 * 60,           // 3 times a day(every 480 minutes)
+        CATCFG_T_CYCLE = 5 * 60,                // every 5 minutes
         // uplink cycle time after bootup
         CATCFG_T_CYCLE_INITIAL = 30,            // every 30 seconds initially
         // number of uplinks at initial rate before resetting
@@ -109,7 +109,7 @@ const char sVersion[] = "1.1.0";
 
 //
 // set this to the branch you're using, if this is a branch.
-const char sBranch[] = "";
+const char sBranch[] = " (5 min)";
 // keep by itself, more or less, for easy git rebasing.
 //
 
