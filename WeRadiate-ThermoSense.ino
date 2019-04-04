@@ -37,32 +37,48 @@ Author:
 
 using namespace McciCatena;
 
-/* how long do we wait between transmissions? (in seconds) */
+/* parameters for controlling the uplink timing */
 enum    {
         // set this to interval between transmissions, in seconds
         // Actual time will be a little longer because have to
         // add measurement and broadcast time, but we attempt
         // to compensate for the gross effects below.
-        CATCFG_T_CYCLE = 480 * 60,        // 3 times a day(every 480 minutes)
-        CATCFG_T_CYCLE_TEST = 30,       // every 10 seconds
+        CATCFG_T_CYCLE = 8 * 60 * 60,           // 3 times a day(every 480 minutes)
+        // uplink cycle time after bootup
+        CATCFG_T_CYCLE_INITIAL = 30,            // every 30 seconds initially
+        // number of uplinks at initial rate before resetting
+        CATCFG_INTERVAL_COUNT_INITIAL = 30,     // repeat for 15 minutes
         };
 
 /* additional timing parameters; ususually you don't change these. */
 enum    {
+        // the warm-up time, in seconds
         CATCFG_T_WARMUP = 1,
+        // the settling time uplink, in seconds
         CATCFG_T_SETTLE = 5,
-        CATCFG_T_OVERHEAD = (CATCFG_T_WARMUP + CATCFG_T_SETTLE),
+        // the amount of overhead, total, in seconds.
+        CATCFG_T_OVERHEAD = (CATCFG_T_WARMUP + CATCFG_T_SETTLE + 4),
+        // the minimum cycle time
+        CATCFG_T_MIN = CATCFG_T_OVERHEAD,
+        // length of day in seconds
+        CATCFG_T_ONE_DAY = 24 * 60 * 60,
+        // maximum programmable cycle time
+        CATCFG_T_MAX = CATCFG_T_ONE_DAY,     // normally one hour max.
+        // default uplink interval, in seconds
+        CATCFG_INTERVAL_COUNT_DEFAULT = 30,
         };
 
+// given a cycle time in seconds, how long should we sleep?
 constexpr uint32_t CATCFG_GetInterval(uint32_t tCycle)
         {
-        return (tCycle < CATCFG_T_OVERHEAD)
-                ? CATCFG_T_OVERHEAD
+        return (tCycle < CATCFG_T_OVERHEAD + 1)
+                ? 1
                 : tCycle - CATCFG_T_OVERHEAD
                 ;
         }
 
 enum    {
+        // how long to sleep, in seconds.
         CATCFG_T_INTERVAL = CATCFG_GetInterval(CATCFG_T_CYCLE),
         };
 
@@ -71,15 +87,17 @@ enum    {
         };
 
 // forwards
-static bool checkCompostSensorPresent(void);
-void settleDoneCb(osjob_t *pSendJob);
-void warmupDoneCb(osjob_t *pSendJob);
-void txFailedDoneCb(osjob_t *pSendJob);
-void sleepDoneCb(osjob_t *pSendJob);
+bool checkCompostSensorPresent(void);
+void fillBuffer(TxBuffer_t &b);
 void prepareToSleep(void);
+Arduino_LoRaWAN::ReceivePortBufferCbFn receiveMessage;
 void recoverFromSleep(void);
 Arduino_LoRaWAN::SendBufferCbFn sendBufferDoneCb;
-    
+void settleDoneCb(osjob_t *pSendJob);
+void setTxCycleTime(unsigned txCycle, unsigned txCount);
+void sleepDoneCb(osjob_t *pSendJob);
+void txFailedDoneCb(osjob_t *pSendJob);
+void warmupDoneCb(osjob_t *pSendJob);
 
 /****************************************************************************\
 |
@@ -87,8 +105,13 @@ Arduino_LoRaWAN::SendBufferCbFn sendBufferDoneCb;
 |
 \****************************************************************************/
 
-const char sVersion[] = "1.0.1";
+const char sVersion[] = "1.1.0";
 
+//
+// set this to the branch you're using, if this is a branch.
+const char sBranch[] = "";
+// keep by itself, more or less, for easy git rebasing.
+//
 
 /****************************************************************************\
 |
@@ -96,6 +119,7 @@ const char sVersion[] = "1.0.1";
 |
 \****************************************************************************/
 
+// the Catena instance
 Catena gCatena;
 
 //
@@ -110,7 +134,7 @@ StatusLed gLed (Catena::PIN_STATUS_LED);
 //
 Catena::LoRaWAN gLoRaWAN;
 
-// The submersible temperature sensor
+// The external temperature sensor
 OneWire oneWire(PIN_ONE_WIRE);
 DallasTemperature sensor_CompostTemp(&oneWire);
 bool fHasCompostTemp;
@@ -123,11 +147,12 @@ bool fBme;
 Catena_Si1133 gSi1133;
 bool fLux;
 
+// the Flash driver requires a SPI instance for the underlying transport.
 SPIClass gSPI2(
-		Catena::PIN_SPI2_MOSI,
-		Catena::PIN_SPI2_MISO,
-		Catena::PIN_SPI2_SCK
-		);
+        Catena::PIN_SPI2_MOSI,
+        Catena::PIN_SPI2_MISO,
+        Catena::PIN_SPI2_SCK
+        );
 
 //   The flash
 Catena_Mx25v8035f gFlash;
@@ -137,8 +162,12 @@ bool fFlash;
 bool fUsbPower;
 
 // the job that's used to synchronize us with the LMIC code
-static osjob_t sensorJob;
-void sensorJob_cb(osjob_t *pJob);
+osjob_t sensorJob;
+
+// the cycle time to use
+unsigned gTxCycle;
+// remaining before we reset to default
+unsigned gTxCycleCount;
 
 /*
 
@@ -172,14 +201,23 @@ void setup(void)
         setup_platform();
         setup_built_in_sensors();
         setup_external_temp_sensor();
-        
+
         gCatena.SafePrintf("End of setup\n");
 
         /* for stm32 core, we need wider tolerances, it seems. This sets the clock tolerence to +/- 10% */
         LMIC_setClockError(10 * 65536 / 100);
-        
+
         /* trigger a join by sending the first packet */
-        startSendingUplink();
+        if (! isManufacturingMode())
+                {
+                if (! gLoRaWAN.IsProvisioned())
+                        gCatena.SafePrintf("LoRaWAN not provisioned yet. Use the commands to set it up.\n");
+                else
+                        {
+                        /* send the first packet */
+                        startSendingUplink();
+                        }
+                }
         }
 
 /*
@@ -222,7 +260,7 @@ void setup_platform(void)
 
         gCatena.SafePrintf("\n");
         gCatena.SafePrintf("-------------------------------------------------------------------------------\n");
-        gCatena.SafePrintf("This is the WeRadiate-ThermoSense program V%s.\n", sVersion);
+        gCatena.SafePrintf("This is the WeRadiate-ThermoSense program V%s%s.\n", sVersion, sBranch);
                 {
                 char sRegion[16];
                 gCatena.SafePrintf("Target network: %s / %s\n",
@@ -230,6 +268,7 @@ void setup_platform(void)
                                 gLoRaWAN.GetRegionString(sRegion, sizeof(sRegion))
                                 );
                 }
+        gCatena.SafePrintf("Current board: %s\n", gCatena.CatenaName());
         gCatena.SafePrintf("Enter 'help' for a list of commands.\n");
         gCatena.SafePrintf("(remember to select 'Line Ending: Newline' at the bottom of the monitor window.)\n");
         gCatena.SafePrintf("--------------------------------------------------------------------------------\n");
@@ -251,6 +290,12 @@ void setup_platform(void)
                 gCatena.SafePrintf("succeeded\n");
                 gCatena.registerObject(&gLoRaWAN);
                 }
+
+        // set up the hook for downlinks: call receiveMessage() on downlink
+        gLoRaWAN.SetReceiveBufferBufferCb(receiveMessage);
+
+        // set up the uplink cycle time.
+        setTxCycleTime(CATCFG_T_CYCLE_INITIAL, CATCFG_INTERVAL_COUNT_INITIAL);
 
         // display the CPU unique ID
         Catena::UniqueID_string_t CpuIDstring;
@@ -351,7 +396,7 @@ Returns:
 void setup_external_temp_sensor(void)
         {
         bool fCompostTemp = checkCompostSensorPresent();
-        
+
         if(!fCompostTemp)
                 {
                 gCatena.SafePrintf("No one-wire temperature sensor detected\n");
@@ -362,21 +407,23 @@ void setup_external_temp_sensor(void)
                 }
         }
 
- static bool checkCompostSensorPresent(void)
+// return true if the compost sensor is attached.
+bool checkCompostSensorPresent(void)
         {
-        /* set D11 high so V_OUT2 is going to be high for onewire sensor */        
+        /* set D11 high so V_OUT2 is going to be high for onewire sensor */
         pinMode(D11, OUTPUT);
         digitalWrite(D11, HIGH);
-        
+
         sensor_CompostTemp.begin();
         return sensor_CompostTemp.getDeviceCount() != 0;
         }
 
+// setup all the on-board sensors
 void setup_built_in_sensors(void)
         {
         uint32_t flags;
         flags = gCatena.GetPlatformFlags();
-  
+
         /* initialize the lux sensor */
         if (flags & CatenaStm32::fHasLuxSi1113)
                 {
@@ -399,7 +446,7 @@ void setup_built_in_sensors(void)
                 gCatena.SafePrintf("No Si1133 wiring\n");
                 fLux = false;
                 }
-    
+
         /* initialize the BME280 */
         if (flags & CatenaStm32::fHasBme280)
                 {
@@ -418,7 +465,7 @@ void setup_built_in_sensors(void)
                 {
                 fBme = false;
                 gCatena.SafePrintf("No BME280 found: check wiring. Just nothing. \n");
-                }                
+                }
         }
 
 /*
@@ -439,26 +486,53 @@ Description:
 
         This version calls gCatena.poll() to drive all the event loops and
         timers. For manufacturing test mode, it continuously reads the sensor values,
-        which will produce serial output. 
+        which will produce serial output.
 
 Returns:
         No explicit result.
 
 */
 
-
-
 void loop(void)
         {
         // put your main code here, to run repeatedly:
         gCatena.poll();
+
+        /* for mfg test, don't tx, just fill */
+        if (isManufacturingMode())
+                {
+                TxBuffer_t b;
+                fillBuffer(b);
+                delay(1000);
+                }
         }
 
-void startSendingUplink(void)
-        {
-        TxBuffer_t b;
-        LedPattern savedLed = gLed.Set(LedPattern::Measuring);
+/*
 
+Name:	fillBuffer()
+
+Function:
+        Make measurements and fill a TxBuffer
+
+Definition:
+        void fillBuffer(
+                TxBuffer_t &b
+                );
+
+Description:
+        This function initializes the buffer with a series of
+        measurements taken from the sensors. If a serial port
+        is attached, it also displays data; so it's useful
+        for manufacturing test, even if you don't want to
+        send the data.
+
+Returns:
+        No explicit result.
+
+*/
+
+void fillBuffer(TxBuffer_t &b)
+        {
         b.begin();
         FlagsSensor3 flag;
 
@@ -473,11 +547,12 @@ void startSendingUplink(void)
         gCatena.SafePrintf("vBat:    %d mV\n", (int) (vBat * 1000.0f));
         b.putV(vBat);
         flag |= FlagsSensor3::FlagVbat;
-      
+
         // vBus is sent as 5000 * v
-        float vBus = gCatena.ReadVbus();
+        float const vBus = updateUsbPower();
         gCatena.SafePrintf("vBus:    %d mV\n", (int) (vBus * 1000.0f));
-        fUsbPower = (vBus > 3.0) ? true : false;
+        b.putV(vBus);
+        flag |= FlagsSensor3::FlagVcc;
 
         uint32_t bootCount;
         if (gCatena.getBootCount(bootCount))
@@ -501,23 +576,23 @@ void startSendingUplink(void)
                 b.putT(m.Temperature);
                 b.putP(m.Pressure);
                 b.putRH(m.Humidity);
-    
+
                 flag |= FlagsSensor3::FlagTPH;
                 }
-    
+
         /*
-        || Measure and transmit the "water temperature" (OneWire)
+        || Measure and transmit the compost temperature (OneWire)
         || tranducer value. This is complicated because we want
         || to support plug/unplug and the sw interface is not
         || really hot-pluggable.
         */
-        
-        /* set D11 high so V_OUT2 is going to be high for onewire sensor */        
+
+        /* set D11 high so V_OUT2 is going to be high for onewire sensor */
         pinMode(D11, OUTPUT);
         digitalWrite(D11, HIGH);
-        
+
         bool fCompostTemp = checkCompostSensorPresent();
-      
+
         if (fCompostTemp)
                 {
                 sensor_CompostTemp.requestTemperatures();
@@ -531,12 +606,45 @@ void startSendingUplink(void)
                 {
                 gCatena.SafePrintf("No compost temperature\n");
                 }
-             
-        /* set D11 low to turn off after measuring */        
+
+        /* set D11 low to turn off after measuring */
 //        digitalWrite(D11, LOW);
         pinMode(D11, INPUT);
-      
+
         *pFlag = uint8_t(flag);
+        }
+
+/*
+
+Name:	startSendingUplink()
+
+Function:
+        Start sending a message to the cloud
+
+Definition:
+        void startSendingUplink(
+                void
+                );
+
+Description:
+        This function takes a set of measurements, and forwards
+        them to the cloud.  It also has the side-effect of
+        starting the cyclical finite state machine; at the end
+        of a transmisison cycle, the system sleeps until the
+        next cycle and then meausures and sends again.
+
+Returns:
+        No explicit result.
+
+*/
+
+void startSendingUplink(void)
+        {
+        TxBuffer_t b;
+        LedPattern savedLed = gLed.Set(LedPattern::Measuring);
+
+        fillBuffer(b);
+
         if (savedLed != LedPattern::Joining)
                 {
                 gLed.Set(LedPattern::Sending);
@@ -545,10 +653,11 @@ void startSendingUplink(void)
                 {
                 gLed.Set(LedPattern::Joining);
                 }
-        
+
         gLoRaWAN.SendBuffer(b.getbase(), b.getn(), sendBufferDoneCb, NULL);
         }
 
+// called from LMIC when transmit is complete.
 void
 sendBufferDoneCb(
         void *pContext,
@@ -558,22 +667,34 @@ sendBufferDoneCb(
         osjobcb_t pFn;
 
         gLed.Set(LedPattern::Settling);
+
+        // assume that we'll continue the loop.
+        pFn = settleDoneCb;
+
         if (! fStatus)
                 {
                 gCatena.SafePrintf("send buffer failed\n");
-                pFn = txFailedDoneCb;
+
+                // if not provisioned, shutdown the loop
+                if (! gLoRaWAN.IsProvisioned())
+                        pFn = txFailedDoneCb;
                 }
         else
                 {
-                pFn = settleDoneCb;
+                gCatena.SafePrintf("tx complete: adrAckReq: %d  adrChanged: %d\n",
+                        LMIC.adrAckReq, LMIC.adrChanged
+                        );
                 }
+
+        // wait for the LMIC to settle down
         os_setTimedCallback(
                 &sensorJob,
-                os_getTime()+sec2osticks(CATCFG_T_SETTLE),
+                os_getTime() + sec2osticks(CATCFG_T_SETTLE),
                 pFn
                 );
         }
 
+// called after settling time to shutdown the LMIC in case of failure
 void
 txFailedDoneCb(
         osjob_t *pSendJob
@@ -584,6 +705,7 @@ txFailedDoneCb(
         gLed.Set(LedPattern::NotProvisioned);
         }
 
+// called after settling time to put the system to sleep
 void settleDoneCb(
         osjob_t *pSendJob
         )
@@ -595,28 +717,39 @@ void settleDoneCb(
 #else
         const bool fCanSleep = true;
 #endif
+
+        // adjust the uplink timing counters.
+        updateTxCycleParameters();
+
         if (! fCanSleep)
                 {
+                /* we're not allowed to do a deep sleep, so use the LMIC mechanisms */
+               ostime_t interval = sec2osticks(CATCFG_GetInterval(gTxCycle));
+
                 gLed.Set(LedPattern::Sleeping);
                 os_setTimedCallback(
                         &sensorJob,
-                        os_getTime() + sec2osticks(CATCFG_T_INTERVAL),
+                        os_getTime() + interval,
                         sleepDoneCb
                         );
                 return;
                 }
+        else
+                {
+                /* we are allowed to do a deep sleep */
+                prepareToSleep();
 
-        /* we are allowed to do a deep sleep */
-        prepareToSleep();
+                ostime_t deepSleepSeconds = CATCFG_GetInterval(gTxCycle);
+                gCatena.Sleep(deepSleepSeconds);
 
-        gCatena.Sleep(CATCFG_T_INTERVAL);
+                /* and now... we're awake again. trigger another measurement */
+                recoverFromSleep();
 
-        /* and now... we're awake again. trigger another measurement */
-        recoverFromSleep();
-
-        sleepDoneCb(pSendJob);
+                sleepDoneCb(pSendJob);
+                }
         }
 
+// called after sleep to schedule work after sensors are awake
 void sleepDoneCb(
         osjob_t *pJob
         )
@@ -628,6 +761,7 @@ void sleepDoneCb(
                 );
         }
 
+// called after warmup is done -- just sends another message.
 void warmupDoneCb(
         osjob_t *pJob
         )
@@ -635,9 +769,10 @@ void warmupDoneCb(
         startSendingUplink();
         }
 
+// prepare system for low-power sleep.
 void prepareToSleep(void)
         {
-        gLed.Set(LedPattern::Off);         
+        gLed.Set(LedPattern::Off);
         Serial.end();
         Wire.end();
         SPI.end();
@@ -645,6 +780,7 @@ void prepareToSleep(void)
                 gSPI2.end();
         }
 
+// recover system after low-power sleep
 void recoverFromSleep(void)
         {
         Serial.begin();
@@ -654,4 +790,135 @@ void recoverFromSleep(void)
                 gSPI2.begin();
         gLed.Set(LedPattern::WarmingUp);
         gSi1133.start();
+        }
+
+// update the uplink cycle parameters
+void updateTxCycleParameters(void)
+        {
+        if (gTxCycleCount > 1)
+                --gTxCycleCount;
+        else
+                {
+                if (gTxCycleCount > 0)
+                        {
+                       gCatena.SafePrintf("resetting tx cycle to default: %u\n", CATCFG_T_CYCLE);
+
+                        gTxCycleCount = 0;
+                        gTxCycle = CATCFG_T_CYCLE;
+                        }
+                }
+        }
+
+// read and return USB power, and update the global fUsbPower flag.
+float updateUsbPower(void)
+        {
+        float vBus = gCatena.ReadVbus();
+        fUsbPower = (vBus > 4.0) ? true : false;
+        return vBus;
+        }
+
+/*
+
+Name:	receiveMessage()
+
+Function:
+        Start sending a message to the cloud
+
+Definition:
+        Arduino_LoRaWAN::ReceivePortBufferCbFn receiveMessage;
+
+        void receiveMessage(
+                void *pContext,
+                uint8_t port,
+                const uint8_t *pMessage,
+                size_t nMessage
+                )
+
+Description:
+        This function takes a set of measurements, and forwards
+        them to the cloud.  It also has the side-effect of
+        starting the cyclical finite state machine; at the end
+        of a transmisison cycle, the system sleeps until the
+        next cycle and then meausures and sends again.
+
+Returns:
+        No explicit result.
+
+*/
+
+void receiveMessage(
+        void *pContext,
+        uint8_t port,
+        const uint8_t *pMessage,
+        size_t nMessage
+        )
+        {
+        unsigned txCycle;
+        unsigned txCount;
+
+        if (port == 0)
+                {
+                gCatena.SafePrintf("MAC message:");
+                for (unsigned i = 0; i < LMIC.dataBeg; ++i)
+                        {
+                        gCatena.SafePrintf(" %02x", LMIC.frame[i]);
+                        }
+                gCatena.SafePrintf("\n");
+                return;
+                }
+
+        if (! (port == 1 && 2 <= nMessage && nMessage <= 3))
+                {
+                gCatena.SafePrintf("invalid message port(%02x)/length(%x)\n",
+                        port, (unsigned) nMessage
+                        );
+                return;
+                }
+
+        txCycle = (pMessage[0] << 8) | pMessage[1];
+
+        if (txCycle < CATCFG_T_MIN || txCycle > CATCFG_T_MAX)
+                {
+                gCatena.SafePrintf("tx cycle time out of range: %u\n", txCycle);
+                return;
+                }
+
+        // byte [2], if present, is the repeat count.
+        // explicitly sending zero causes it to stick.
+        // sending nothing uses the default
+        txCount = CATCFG_INTERVAL_COUNT_DEFAULT;
+        if (nMessage >= 3)
+                {
+                txCount = pMessage[2];
+                }
+
+        setTxCycleTime(txCycle, txCount);
+        }
+
+// set the transmit cycle time
+void setTxCycleTime(
+        unsigned txCycle,
+        unsigned txCount
+        )
+        {
+        if (txCount > 0)
+                gCatena.SafePrintf(
+                        "message cycle time %u seconds for %u messages\n",
+                        txCycle, txCount
+                        );
+        else
+                gCatena.SafePrintf(
+                        "message cycle time %u seconds indefinitely\n",
+                        txCycle
+                        );
+
+        gTxCycle = txCycle;
+        gTxCycleCount = txCount;
+        }
+
+// is device in manufacturing mode?
+bool isManufacturingMode(void)
+        {
+        return (gCatena.GetOperatingFlags() &
+                        static_cast<uint32_t>(gCatena.OPERATING_FLAGS::fManufacturingTest)) != 0;
         }
