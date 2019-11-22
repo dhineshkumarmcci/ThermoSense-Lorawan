@@ -1,7 +1,14 @@
-// This function decodes the record (port 1, format 0x15) sent by the
-// MCCI Catena 4450 soil/water application.
-// For use with console.thethingsnetwork.org
-// 2017-09-19 add dewpoints.
+/*
+Name:   WeRadiate-decoder-ttn.js
+Function:
+    This function decodes the record (port 1, format 0x15) sent by the
+    MCCI Catena 4612 soil/water application for WeRadiate TTN console.
+Copyright and License:
+    See accompanying LICENSE file at https://github.com/mcci-catena/MCCI-Catena-PMS7003/
+Author:
+    Terry Moore, MCCI Corporation   July 2019
+    Sungjoon Park, MCCI Corporation November 2019
+*/
 
 // calculate dewpoint (degrees C) given temperature (C) and relative humidity (0..100)
 // from http://andrew.rsmas.miami.edu/bmcnoldy/Humidity.html
@@ -31,97 +38,8 @@ function Decoder(bytes, port) {
 
     if (port === 1) {
         cmd = bytes[0];
-        if (cmd == 0x14) {
-            // decode Catena 4450 M101 data
-
-            // test vectors:
-            //  14 01 18 00 ==> vBat = 1.5
-            //  14 01 F8 00 ==> vBat = -0.5
-            //  14 05 F8 00 42 ==> boot: 66, vBat: -0.5
-            //  14 0D F8 00 42 17 80 59 35 80 ==> adds one temp of 23.5, rh = 50, p = 913.48
-
-            // i is used as the index into the message. Start with the flag byte.
-            var i = 1;
-            // fetch the bitmap.
-            var flags = bytes[i++];
-
-            if (flags & 0x1) {
-                // set vRaw to a uint16, and increment pointer
-                var vRaw = (bytes[i] << 8) + bytes[i + 1];
-                i += 2;
-                // interpret uint16 as an int16 instead.
-                if (vRaw & 0x8000)
-                    vRaw += -0x10000;
-                // scale and save in decoded.
-                decoded.vBat = vRaw / 4096.0;
-            }
-
-            if (flags & 0x2) {
-                var vRawBus = (bytes[i] << 8) + bytes[i + 1];
-                i += 2;
-                if (vRawBus & 0x8000)
-                    vRawBus += -0x10000;
-                decoded.vBus = vRawBus / 4096.0;
-            }
-
-            if (flags & 0x4) {
-                var iBoot = bytes[i];
-                i += 1;
-                decoded.boot = iBoot;
-            }
-
-            if (flags & 0x8) {
-                // we have temp, pressure, RH
-                var tRaw = (bytes[i] << 8) + bytes[i + 1];
-                if (tRaw & 0x8000)
-                    tRaw = -0x10000 + tRaw;
-                i += 2;
-                var pRaw = (bytes[i] << 8) + bytes[i + 1];
-                i += 2;
-                var hRaw = bytes[i++];
-
-                decoded.tempC = tRaw / 256;
-                decoded.error = "none";
-                decoded.p = pRaw * 4 / 100.0;
-                decoded.rh = hRaw / 256 * 100;
-                decoded.tDewC = dewpoint(decoded.tempC, decoded.rh);
-            }
-
-            if (flags & 0x10) {
-                // we have lux
-                var luxRaw = (bytes[i] << 8) + bytes[i + 1];
-                i += 2;
-                decoded.lux = luxRaw;
-            }
-
-            if (flags & 0x20) {
-                // watthour
-                var powerIn = (bytes[i] << 8) + bytes[i + 1];
-                i += 2;
-                var powerOut = (bytes[i] << 8) + bytes[i + 1];
-                i += 2;
-                decoded.powerUsedCount = powerIn;
-                decoded.powerSourcedCount = powerOut;
-            }
-
-            if (flags & 0x40) {
-                // normalize floating pulses per hour
-                var floatIn = (bytes[i] << 8) + bytes[i + 1];
-                i += 2;
-                var floatOut = (bytes[i] << 8) + bytes[i + 1];
-                i += 2;
-
-                var exp1 = floatIn >> 12;
-                var exp2 = floatOut >> 12;
-                var mant1 = (floatIn & 0xFFF) / 4096.0;
-                var mant2 = (floatOut & 0xFFF) / 4096.0;
-                var powerPerHourIn = mant1 * Math.pow(2, exp1 - 15) * 60 * 60 * 4;
-                var powerPerHourOut = mant2 * Math.pow(2, exp2 - 15) * 60 * 60 * 4;
-                decoded.powerUsedPerHour = powerPerHourIn;
-                decoded.powerSourcedPerHour = powerPerHourOut;
-            }
-        } else if (cmd == 0x15) {
-            // decode Catena 4450 M102 data
+        if (cmd == 0x15) {
+            // decode Catena 4612 M102 data
 
             // test vectors:
             //  15 01 18 00 ==> vBat = 1.5
@@ -234,7 +152,6 @@ function Decoder(bytes, port) {
                 if (tempRaw & 0x8000)
                     tempRaw = -0x10000 + tempRaw;
                 decoded.tWater = tempRaw / 256;
-                decoded.tempC = decoded.tWater;
             }
 
             if (flags & 0x40) {
