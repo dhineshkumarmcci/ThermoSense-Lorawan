@@ -86,6 +86,9 @@ enum    {
         PIN_ONE_WIRE =  A2,        // XSDA1 == A2
         };
 
+// boost regulator control
+constexpr uint8_t kBoosterPowerOn = D14;
+
 // forwards
 bool checkCompostSensorPresent(void);
 void fillBuffer(TxBuffer_t &b);
@@ -309,6 +312,10 @@ void setup_platform(void)
 
         uint32_t flags;
         const CATENA_PLATFORM * const pPlatform = gCatena.GetPlatform();
+
+        // set boost regulator control pin in OUTPUT mode
+        pinMode(kBoosterPowerOn, OUTPUT);
+        digitalWrite(kBoosterPowerOn, 0);
 
         if (pPlatform)
                 {
@@ -561,6 +568,13 @@ void fillBuffer(TxBuffer_t &b)
                 flag |= FlagsSensor3::FlagBoot;
                 }
 
+        if (!fUsbPower && (vBat < 2.75f))
+                {
+                digitalWrite(kBoosterPowerOn, 1);
+                gCatena.SafePrintf("Boost Regulator turned ON\n");
+                delay(90);
+                }
+
         if (fBme)
                 {
                 Adafruit_BME280::Measurements m = gBme.readTemperaturePressureHumidity();
@@ -776,6 +790,7 @@ void prepareToSleep(void)
         Serial.end();
         Wire.end();
         SPI.end();
+        pinMode(kBoosterPowerOn, INPUT);
         if (fFlash)
                 gSPI2.end();
         }
@@ -786,6 +801,8 @@ void recoverFromSleep(void)
         Serial.begin();
         Wire.begin();
         SPI.begin();
+        pinMode(kBoosterPowerOn, OUTPUT);
+        digitalWrite(kBoosterPowerOn, 0);
         if (fFlash)
                 gSPI2.begin();
         gLed.Set(LedPattern::WarmingUp);
